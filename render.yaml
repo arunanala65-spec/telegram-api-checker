@@ -1,0 +1,17 @@
+services:
+  - type: worker
+    name: telegram-api-checker
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ALLOWED_USER_IDS
+        sync: false
+      - key: MAX_FILE_LINES
+        value: "100"
+      - key: BULK_CONCURRENCY
+        value: "5"
+      - key: AWS_REGION
+        value: ap-south-1
