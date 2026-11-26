@@ -39,8 +39,8 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from checkers import (
     check_brevo,
@@ -62,7 +62,11 @@ BULK_CONCURRENCY = int(os.environ.get("BULK_CONCURRENCY", "5"))
 MAX_FILE_BYTES = 200_000
 DEFAULT_SES_REGION = os.environ.get("AWS_REGION", "ap-south-1").strip() or "ap-south-1"
 # Telegram log forwarding: env LOG_CHAT_ID wins; otherwise /loghere at runtime.
+# Logs are OWNER-ONLY: env OWNER_ID wins; otherwise the first user to send
+# /loghere claims ownership. Only the owner can set the log chat or view /logs.
 LOG_CHAT_ID_ENV = os.environ.get("LOG_CHAT_ID", "").strip()
+OWNER_ID_ENV = os.environ.get("OWNER_ID", "").strip()
+_runtime_owner_id = None  # claimed via /loghere, persisted to LOG_STATE_FILE
 LOG_FILE = os.environ.get("LOG_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "checker.log"))
 LOG_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "log_config.json")
 _runtime_log_chat_id = None  # set by /loghere, persisted to LOG_STATE_FILE
@@ -99,13 +103,16 @@ def _now_str() -> str:
 
 
 def _load_log_state():
-    global _runtime_log_chat_id
+    global _runtime_log_chat_id, _runtime_owner_id
     try:
         with open(LOG_STATE_FILE, encoding="utf-8") as f:
             data = json.load(f)
         v = data.get("log_chat_id")
         if v is not None:
             _runtime_log_chat_id = int(v)
+        o = data.get("owner_id")
+        if o is not None:
+            _runtime_owner_id = int(o)
     except Exception:
         pass
 
@@ -113,9 +120,27 @@ def _load_log_state():
 def _save_log_state():
     try:
         with open(LOG_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"log_chat_id": _runtime_log_chat_id}, f)
+            json.dump({"log_chat_id": _runtime_log_chat_id, "owner_id": _runtime_owner_id}, f)
     except Exception:
         pass
+
+
+def get_owner_id():
+    if OWNER_ID_ENV:
+        try:
+            return int(OWNER_ID_ENV)
+        except ValueError:
+            pass
+    if _runtime_owner_id is not None:
+        return _runtime_owner_id
+    if ALLOWED_USER_IDS:
+        return sorted(ALLOWED_USER_IDS)[0]
+    return None
+
+
+def is_owner(update: Update) -> bool:
+    owner = get_owner_id()
+    return bool(owner and update.effective_user and update.effective_user.id == owner)
 
 
 def get_log_chat_id():
@@ -126,8 +151,9 @@ def get_log_chat_id():
             return LOG_CHAT_ID_ENV
     if _runtime_log_chat_id is not None:
         return _runtime_log_chat_id
-    if ALLOWED_USER_IDS:
-        return sorted(ALLOWED_USER_IDS)[0]
+    owner = get_owner_id()
+    if owner:
+        return owner  # owner's private chat ID == owner user ID
     return None
 
 
@@ -212,8 +238,10 @@ I check *your own* SendGrid, Mailgun, Mailjet, Brevo, AWS SES and SMTP accounts 
 *Bulk file:*
 Send a `.txt` file, one check per line (max {max_lines}). Format is in /help.
 
-*Logs:*
-Send `/loghere` once in this chat and every check result (masked) will also be forwarded here as a log. `/myid` shows your IDs, `/logs` shows recent logs.
+*Logs (owner-only):*
+The bot owner sends `/loghere` once and every check result (masked) is forwarded to the owner. `/myid` shows your IDs, `/logs` (owner only) shows recent logs.
+
+Tap a checker button below to start:
 
 Your message with a key is deleted automatically when possible, and keys are only shown masked.
 
@@ -261,21 +289,81 @@ Max {max_lines} lines per file. Results come back as live.txt / dead.txt (keys m
 
 *Auto-detect:* you can also just send a key — `SG.` = SendGrid, `xkeysib-` = Brevo, `key-` = Mailgun. SES / Mailjet / SMTP need their command because they need 2+ parts.
 
-*Logs to Telegram:*
-`/loghere` — set THIS chat as the log destination (do it once after deploy)
-`/myid` — show your user ID + chat ID (for LOG_CHAT_ID / ALLOWED_USER_IDS)
-`/logs` — show the last 20 log entries
-Every single check and every bulk summary is forwarded to the log chat. Logs contain masked keys only — never full secrets.
+*Menu:* tap /menu (or /start) and pick a checker button — SendGrid, Brevo, Mailgun, Mailjet, AWS SES, SMTP — then send the key when asked. /cancel aborts. Commands below still work too. Results also show the account's sender emails/identities when the provider exposes them.
+
+*Logs to Telegram (owner-only):*
+`/loghere` — owner only: set THIS chat as the log destination (the first user to send it becomes the owner; or set env OWNER_ID)
+`/myid` — show your user ID + chat ID (for OWNER_ID / LOG_CHAT_ID / ALLOWED_USER_IDS)
+`/logs` — owner only: show the last 20 log entries
+Every single check and every bulk summary is forwarded to the owner's log chat. Logs contain masked keys only — never full secrets.
 
 *Privacy:* read-only official endpoints + SMTP login only. Full keys/passwords are never saved or logged.
 """
+
+
+PROVIDER_PROMPTS = {
+    "sendgrid": "Send your *SendGrid* API key (starts with `SG.`):",
+    "brevo": "Send your *Brevo* API key (starts with `xkeysib-`):",
+    "mailgun": "Send your *Mailgun* API key (starts with `key-`). Optional: add domain + region after it, e.g. `key-xxx mg.example.com us`:",
+    "mailjet": "Send your *Mailjet* keys as `api_key:secret_key`:",
+    "ses": "Send your *AWS SES* keys as `ACCESS_KEY:SECRET_KEY` (optional region after, e.g. `AKIA...:secret ap-south-1`):",
+    "smtp": "Send your *SMTP* login as `host:port:username:password`:",
+}
+
+
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("SendGrid", callback_data="prov:sendgrid"), InlineKeyboardButton("Brevo", callback_data="prov:brevo")],
+            [InlineKeyboardButton("Mailgun", callback_data="prov:mailgun"), InlineKeyboardButton("Mailjet", callback_data="prov:mailjet")],
+            [InlineKeyboardButton("AWS SES", callback_data="prov:ses"), InlineKeyboardButton("SMTP", callback_data="prov:smtp")],
+            [InlineKeyboardButton("Bulk .txt", callback_data="menu:bulk"), InlineKeyboardButton("Help", callback_data="menu:help")],
+        ]
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text("Sorry, this bot is private.")
         return
-    await update.message.reply_text(START_TEXT.format(max_lines=MAX_FILE_LINES), parse_mode="Markdown")
+    await update.message.reply_text(
+        START_TEXT.format(max_lines=MAX_FILE_LINES), parse_mode="Markdown", reply_markup=main_menu_keyboard()
+    )
+
+
+async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await update.message.reply_text("Sorry, this bot is private.")
+        return
+    await update.message.reply_text("Pick a checker:", reply_markup=main_menu_keyboard())
+
+
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("pending", None)
+    await update.message.reply_text("Cancelled. Pick a checker:", reply_markup=main_menu_keyboard())
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_allowed(update):
+        return
+    data = query.data or ""
+    if data.startswith("prov:"):
+        provider = data.split(":", 1)[1]
+        if provider in PROVIDER_PROMPTS:
+            context.user_data["pending"] = provider
+            await query.message.reply_text(
+                PROVIDER_PROMPTS[provider] + "\n\n(/cancel to abort)", parse_mode="Markdown"
+            )
+    elif data == "menu:bulk":
+        await query.message.reply_text(
+            "Send a `.txt` file, one check per line (max "
+            f"{MAX_FILE_LINES}). Formats are in /help — e.g. `sendgrid|SG.your_key`.",
+            parse_mode="Markdown",
+        )
+    elif data == "menu:help":
+        await query.message.reply_text(HELP_TEXT.format(max_lines=MAX_FILE_LINES), parse_mode="Markdown")
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -312,11 +400,18 @@ async def loghere_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text("Sorry, this bot is private.")
         return
-    global _runtime_log_chat_id
+    global _runtime_log_chat_id, _runtime_owner_id
+    owner = get_owner_id()
+    if owner and not is_owner(update):
+        await update.message.reply_text("🔒 Logs are owner-only. Only the bot owner can set the log destination.")
+        return
+    if not owner:
+        # First claim: this user becomes the bot owner for log purposes.
+        _runtime_owner_id = update.effective_user.id
     _runtime_log_chat_id = update.effective_chat.id
     _save_log_state()
     await update.message.reply_text(
-        "✅ Log destination set to this chat.\n"
+        "✅ Log destination set to this chat (owner-only).\n"
         "Every check result (masked keys only) will now be forwarded here.\n"
         "Send /logs anytime to see recent entries."
     )
@@ -326,6 +421,9 @@ async def loghere_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text("Sorry, this bot is private.")
+        return
+    if not is_owner(update):
+        await update.message.reply_text("🔒 Logs are owner-only. The bot owner can view them with /logs after sending /loghere.")
         return
     try:
         with open(LOG_FILE, encoding="utf-8") as f:
@@ -445,10 +543,52 @@ def detect_provider(text: str):
     return None
 
 
+async def _run_pending(update: Update, context: ContextTypes.DEFAULT_TYPE, provider: str, text: str):
+    """Run a check for the provider chosen via the menu buttons."""
+    if provider == "sendgrid":
+        await _reply_result(update, context, await run_sync(check_sendgrid, text.split()[0]))
+    elif provider == "brevo":
+        await _reply_result(update, context, await run_sync(check_brevo, text.split()[0]))
+    elif provider == "mailgun":
+        parts = text.split()
+        domain = parts[1] if len(parts) > 1 else ""
+        region = parts[2] if len(parts) > 2 else "us"
+        await _reply_result(update, context, await run_sync(check_mailgun, parts[0], domain, region))
+    elif provider == "mailjet":
+        if ":" not in text:
+            await update.message.reply_text("Mailjet needs `api_key:secret_key`. Tap Mailjet in /menu and try again.", parse_mode="Markdown")
+            return
+        k, s = text.split(":", 1)
+        await _reply_result(update, context, await run_sync(check_mailjet, k.strip(), s.strip()))
+    elif provider == "ses":
+        parts = text.split()
+        pair = parts[0]
+        if ":" in pair:
+            ak, sk = pair.split(":", 1)
+        elif len(parts) >= 2:
+            ak, sk = parts[0], parts[1]
+            parts = [pair, ""] + parts[2:]
+        else:
+            await update.message.reply_text("SES needs `ACCESS_KEY:SECRET_KEY`. Tap AWS SES in /menu and try again.", parse_mode="Markdown")
+            return
+        region = parts[1] if len(parts) > 1 and parts[1] else DEFAULT_SES_REGION
+        await _reply_result(update, context, await run_sync(check_ses, ak.strip(), sk.strip(), region))
+    elif provider == "smtp":
+        parsed = parse_smtp_line(text)
+        if not parsed:
+            await update.message.reply_text("SMTP needs `host:port:username:password`. Tap SMTP in /menu and try again.", parse_mode="Markdown")
+            return
+        await _reply_result(update, context, await run_sync(check_smtp, *parsed))
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
     text = (update.message.text or "").strip()
+    pending = context.user_data.pop("pending", None)
+    if pending:
+        await _run_pending(update, context, pending, text)
+        return
     det = detect_provider(text)
     if det:
         provider, key = det
@@ -460,9 +600,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _reply_result(update, context, await run_sync(check_mailgun, key, "", "us"))
         return
     await update.message.reply_text(
-        "Send a command like `/sendgrid SG.your_key`, or type /help.\n"
+        "Pick a checker from the menu, or send a command like `/sendgrid SG.your_key`.\n"
         "Auto-detect works for SendGrid (`SG.`), Brevo (`xkeysib-`) and Mailgun (`key-`) keys.",
         parse_mode="Markdown",
+        reply_markup=main_menu_keyboard(),
     )
 
 
@@ -584,6 +725,9 @@ def main():
     _start_keepalive_server()
     app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu_cmd))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
+    app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("myid", myid_cmd))
     app.add_handler(CommandHandler("loghere", loghere_cmd))

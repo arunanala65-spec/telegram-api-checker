@@ -78,6 +78,7 @@ def check_sendgrid(api_key: str) -> dict:
         except requests.RequestException:
             pass
         lines.append("Limit: not readable with this key's scopes")
+        lines.extend(_sendgrid_senders(headers))
         return _result("SendGrid", True, m, lines, "Create a key with full access to see the exact limit.")
     if not r.ok:
         return _result("SendGrid", False, m, [f"HTTP {r.status_code}"], (r.text or "")[:200])
@@ -105,7 +106,29 @@ def check_sendgrid(api_key: str) -> dict:
         lines.append(f"Next reset: {j['next_reset']}")
     if not lines:
         lines.append("Credits endpoint OK (no quota fields returned)")
+    lines.extend(_sendgrid_senders(headers))
     return _result("SendGrid", True, m, lines)
+
+
+def _sendgrid_senders(headers) -> list:
+    """Verified single-sender identities for the SendGrid account (best effort)."""
+    try:
+        r = requests.get("https://api.sendgrid.com/v3/senders", headers=headers, timeout=TIMEOUT)
+        if not r.ok:
+            return []
+        data = r.json() if r.text else []
+        if not isinstance(data, list) or not data:
+            return ["Senders: none (no verified single senders)"]
+        out = [f"Senders: {len(data)}"]
+        for s in data[:5]:
+            frm = s.get("from") or {}
+            email = frm.get("email", "?")
+            name = frm.get("name") or s.get("nickname") or ""
+            status = "verified" if s.get("verified") else "unverified"
+            out.append(f"• {email}" + (f" ({name})" if name else "") + f" — {status}")
+        return out
+    except requests.RequestException:
+        return []
 
 
 # ---------------------------------------------------------------- Mailgun
@@ -151,6 +174,24 @@ def check_mailgun(api_key: str, domain: str = "", region: str = "us") -> dict:
                     lines.append(f"Domain {d}: not found / HTTP {dr.status_code}")
             except requests.RequestException:
                 pass
+        # SMTP sender logins per domain (best effort, first 3 domains).
+        sender_lines = []
+        for it in items[:3]:
+            dname = it.get("name")
+            if not dname:
+                continue
+            try:
+                cr = requests.get(f"{base}/v3/domains/{dname}/credentials", params={"limit": 5}, auth=("api", key), timeout=TIMEOUT)
+                if cr.ok:
+                    creds = (cr.json() or {}).get("items") or []
+                    for c in creds[:3]:
+                        if c.get("login"):
+                            sender_lines.append(f"• {c['login']}")
+            except requests.RequestException:
+                pass
+        if sender_lines:
+            lines.append("SMTP senders:")
+            lines.extend(sender_lines[:5])
         lines.append("Limit: Mailgun does not expose the sending limit via API — check Sending → Overview in the dashboard")
         return _result("Mailgun", True, m, lines)
     return _result("Mailgun", False, m, [], last_err or "Invalid API key.")
@@ -225,6 +266,21 @@ def check_brevo(api_key: str) -> dict:
         lines.append(f"SMTP relay enabled: {j['relay']['enabled']}")
     if not lines:
         lines.append("Account endpoint OK")
+    # Sender identities (best effort).
+    try:
+        sr = requests.get("https://api.brevo.com/v3/senders", headers={"api-key": key, "accept": "application/json"}, timeout=TIMEOUT)
+        if sr.ok:
+            senders = (sr.json() or {}).get("senders") or []
+            if senders:
+                lines.append(f"Senders: {len(senders)}")
+                for s in senders[:5]:
+                    status = "active" if s.get("active") else "inactive"
+                    nm = s.get("name") or ""
+                    lines.append(f"• {s.get('email', '?')}" + (f" ({nm})" if nm else "") + f" — {status}")
+            else:
+                lines.append("Senders: none")
+    except requests.RequestException:
+        pass
     return _result("Brevo", True, m, lines)
 
 
@@ -312,7 +368,7 @@ def check_ses(access_key: str, secret_key: str, region: str = "ap-south-1") -> d
         s2, root2, _ = _ses_call(ak, sk, region, "ListIdentities", "MaxItems=10")
         if s2 == 200 and root2 is not None:
             idents = [(el.text or "").strip() for el in root2.iter() if (el.tag.endswith("}member") or el.tag == "member")]
-            lines.append(f"Verified identities (first 10): {len(idents)}")
+            lines.append(f"Verified sender identities (first 10): {len(idents)}")
             for x in idents[:5]:
                 lines.append(f"• {x}")
     except Exception:
@@ -356,6 +412,7 @@ def check_smtp(host: str, port: int, username: str, password: str) -> dict:
         server.login(user, pw)
         lines = [
             f"Host: {host}:{port}",
+            f"Sender account: {user}",
             f"Banner: {banner_s.strip()[:90]}",
             f"TLS: {'yes' if tls_used else 'no'}",
         ]
