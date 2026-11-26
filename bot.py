@@ -92,12 +92,10 @@ async def try_delete(update: Update):
 
 # ---------- Logging (masked only — never secrets) ----------
 def _now_str() -> str:
-    try:
-        from zoneinfo import ZoneInfo
+    # WIB is a fixed UTC+7 offset (no DST) — avoids any tzdata dependency.
+    from datetime import timedelta
 
-        return datetime.now(ZoneInfo("Asia/Jakarta")).strftime("%Y-%m-%d %H:%M:%S WIB")
-    except Exception:
-        return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    return datetime.now(timezone(timedelta(hours=7))).strftime("%Y-%m-%d %H:%M:%S WIB")
 
 
 def _load_log_state():

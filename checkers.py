@@ -8,8 +8,12 @@ secrets are never logged and are masked in every result.
 Providers: SendGrid, Mailgun, Mailjet, Brevo, AWS SES, generic SMTP.
 """
 
+import hashlib
+import hmac
 import smtplib
 import ssl
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 
 import requests
 
@@ -225,6 +229,49 @@ def check_brevo(api_key: str) -> dict:
 
 
 # ---------------------------------------------------------------- AWS SES
+# Implemented with plain SigV4-signed HTTPS calls (no AWS SDK) to keep the
+# bot image small enough for tiny free hosts (128 MB RAM).
+def _ses_call(ak: str, sk: str, region: str, action: str, extra: str = ""):
+    """POST one SES Query API action. Return (status_code, xml_root_or_none, raw_text)."""
+    host = f"email.{region}.amazonaws.com"
+    body = f"Action={action}&Version=2010-12-01" + (f"&{extra}" if extra else "")
+    now = datetime.now(timezone.utc)
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = now.strftime("%Y%m%d")
+    payload_hash = hashlib.sha256(body.encode()).hexdigest()
+    canonical_headers = f"content-type:application/x-www-form-urlencoded\nhost:{host}\nx-amz-date:{amz_date}\n"
+    signed_headers = "content-type;host;x-amz-date"
+    canonical_request = f"POST\n/\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    scope = f"{date_stamp}/{region}/ses/aws4_request"
+    string_to_sign = f"AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{hashlib.sha256(canonical_request.encode()).hexdigest()}"
+
+    def _sign(key: bytes, msg: str) -> bytes:
+        return hmac.new(key, msg.encode(), hashlib.sha256).digest()
+
+    k_signing = _sign(_sign(_sign(_sign(("AWS4" + sk).encode(), date_stamp), region), "ses"), "aws4_request")
+    signature = hmac.new(k_signing, string_to_sign.encode(), hashlib.sha256).hexdigest()
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "X-Amz-Date": amz_date,
+        "Authorization": f"AWS4-HMAC-SHA256 Credential={ak}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
+    }
+    r = requests.post(f"https://{host}/", data=body, headers=headers, timeout=TIMEOUT)
+    try:
+        root = ET.fromstring(r.text)
+    except ET.ParseError:
+        root = None
+    return r.status_code, root, r.text or ""
+
+
+def _xml_text(root, tag: str):
+    if root is None:
+        return None
+    for el in root.iter():
+        if el.tag.endswith("}" + tag) or el.tag == tag:
+            return (el.text or "").strip()
+    return None
+
+
 def check_ses(access_key: str, secret_key: str, region: str = "ap-south-1") -> dict:
     ak = (access_key or "").strip()
     sk = (secret_key or "").strip()
@@ -233,31 +280,25 @@ def check_ses(access_key: str, secret_key: str, region: str = "ap-south-1") -> d
     if not ak or not sk:
         return _result("AWS SES", False, m, [], "AWS SES needs BOTH the Access Key ID and the Secret Access Key.")
     try:
-        import boto3
-        from botocore.exceptions import ClientError, NoCredentialsError
-    except ImportError:
-        return _result("AWS SES", False, m, [], "boto3 is not installed on the server.")
+        status, root, raw = _ses_call(ak, sk, region, "GetSendQuota")
+    except requests.RequestException as e:
+        return _result("AWS SES", False, m, [f"Region checked: {region}"], f"Network error: {e}"[:250])
 
-    try:
-        client = boto3.client("ses", region_name=region, aws_access_key_id=ak, aws_secret_access_key=sk)
-        quota = client.get_send_quota()
-    except ClientError as e:
-        code = (e.response or {}).get("Error", {}).get("Code", "ClientError")
-        msg = (e.response or {}).get("Error", {}).get("Message", str(e))
+    if status != 200:
+        code = _xml_text(root, "Code") or f"HTTP {status}"
+        msg = _xml_text(root, "Message") or raw[:200]
         if code in ("InvalidClientTokenId", "SignatureDoesNotMatch", "AuthFailure"):
             return _result("AWS SES", False, m, [f"Status: Invalid credentials ({code})", f"Region checked: {region}"], msg[:200])
         return _result("AWS SES", False, m, [f"AWS error: {code}", f"Region checked: {region}"], msg[:200])
-    except Exception as e:  # network, endpoint, etc.
-        return _result("AWS SES", False, m, [f"Region checked: {region}"], f"Error: {e}"[:250])
 
-    max24 = quota.get("Max24HourSend")
-    rate = quota.get("MaxSendRate")
-    sent = quota.get("SentLast24Hours")
+    max24 = _xml_text(root, "Max24HourSend")
+    rate = _xml_text(root, "MaxSendRate")
+    sent = _xml_text(root, "SentLast24Hours")
     lines = [f"Region: {region}"]
     if max24 is not None:
-        lines.append(f"Max per 24h: {int(max24) if float(max24).is_integer() else max24}")
+        lines.append(f"Max per 24h: {int(float(max24)) if float(max24).is_integer() else max24}")
     if sent is not None:
-        lines.append(f"Sent last 24h: {int(sent) if float(sent).is_integer() else sent}")
+        lines.append(f"Sent last 24h: {int(float(sent)) if float(sent).is_integer() else sent}")
     if max24 is not None and sent is not None:
         try:
             lines.append(f"Remaining (24h): {int(float(max24) - float(sent))}")
@@ -268,11 +309,12 @@ def check_ses(access_key: str, secret_key: str, region: str = "ap-south-1") -> d
     if max24 is not None and float(max24) <= 200:
         lines.append("Note: looks like SANDBOX (≤200/day) — production access not granted yet")
     try:
-        ids = client.list_identities(MaxItems=10)
-        idents = ids.get("Identities") or []
-        lines.append(f"Verified identities (first 10): {len(idents)}")
-        for x in idents[:5]:
-            lines.append(f"• {x}")
+        s2, root2, _ = _ses_call(ak, sk, region, "ListIdentities", "MaxItems=10")
+        if s2 == 200 and root2 is not None:
+            idents = [(el.text or "").strip() for el in root2.iter() if (el.tag.endswith("}member") or el.tag == "member")]
+            lines.append(f"Verified identities (first 10): {len(idents)}")
+            for x in idents[:5]:
+                lines.append(f"• {x}")
     except Exception:
         pass
     return _result("AWS SES", True, m, lines)
