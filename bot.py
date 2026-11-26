@@ -39,8 +39,8 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import KeyboardButton, ReplyKeyboardMarkup, Update
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from checkers import (
     check_brevo,
@@ -218,35 +218,10 @@ async def send_log(context: ContextTypes.DEFAULT_TYPE, text: str):
         log.warning("Log forward failed: %s", e)
 
 
-START_TEXT = """👋 Hi! I'm the API Limit + SMTP Checker.
+START_TEXT = """👋 *API Limit + SMTP Checker*
 
-I check *your own* SendGrid, Mailgun, Mailjet, Brevo, AWS SES and SMTP accounts — valid or not, and how much limit is left. Nothing is stored, no email is sent.
-
-*Commands:*
-`/sendgrid SG.your_key`
-`/brevo xkeysib-your_key`
-`/mailgun key-your_key [domain] [us|eu]`
-`/mailjet api_key:secret_key`
-`/ses AKIA...:secret_key [region]`
-`/smtp host:port:username:password`
-
-*Examples:*
-`/sendgrid SG.abc123...`
-`/ses AKIAEXAMPLE:secretkey ap-south-1`
-`/smtp smtp.sendgrid.net:587:apikey:SG.abc123...`
-
-*Bulk file:*
-Send a `.txt` file, one check per line (max {max_lines}). Format is in /help.
-
-*Logs (owner-only):*
-The bot owner sends `/loghere` once and every check result (masked) is forwarded to the owner. `/myid` shows your IDs, `/logs` (owner only) shows recent logs.
-
-Tap a checker button below to start:
-
-Your message with a key is deleted automatically when possible, and keys are only shown masked.
-
-Type /help for details.
-"""
+Tap a checker below, then send the key when asked.
+Bulk: send a `.txt` file (max {max_lines} lines). Details: /help"""
 
 HELP_TEXT = """🛠 *Help — API Limit + SMTP Checker*
 
@@ -311,14 +286,26 @@ PROVIDER_PROMPTS = {
 }
 
 
-def main_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+BUTTON_MAP = {
+    "📧 SendGrid": "sendgrid",
+    "📨 Brevo": "brevo",
+    "📬 Mailgun": "mailgun",
+    "✉️ Mailjet": "mailjet",
+    "☁️ AWS SES": "ses",
+    "🖥 SMTP": "smtp",
+}
+
+
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
         [
-            [InlineKeyboardButton("SendGrid", callback_data="prov:sendgrid"), InlineKeyboardButton("Brevo", callback_data="prov:brevo")],
-            [InlineKeyboardButton("Mailgun", callback_data="prov:mailgun"), InlineKeyboardButton("Mailjet", callback_data="prov:mailjet")],
-            [InlineKeyboardButton("AWS SES", callback_data="prov:ses"), InlineKeyboardButton("SMTP", callback_data="prov:smtp")],
-            [InlineKeyboardButton("Bulk .txt", callback_data="menu:bulk"), InlineKeyboardButton("Help", callback_data="menu:help")],
-        ]
+            [KeyboardButton("📧 SendGrid"), KeyboardButton("📨 Brevo")],
+            [KeyboardButton("📬 Mailgun"), KeyboardButton("✉️ Mailjet")],
+            [KeyboardButton("☁️ AWS SES"), KeyboardButton("🖥 SMTP")],
+            [KeyboardButton("📄 Bulk .txt"), KeyboardButton("❓ Help")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
     )
 
 
@@ -343,27 +330,31 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Cancelled. Pick a checker:", reply_markup=main_menu_keyboard())
 
 
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not is_allowed(update):
-        return
-    data = query.data or ""
-    if data.startswith("prov:"):
-        provider = data.split(":", 1)[1]
-        if provider in PROVIDER_PROMPTS:
-            context.user_data["pending"] = provider
-            await query.message.reply_text(
-                PROVIDER_PROMPTS[provider] + "\n\n(/cancel to abort)", parse_mode="Markdown"
-            )
-    elif data == "menu:bulk":
-        await query.message.reply_text(
+async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
+    """Handle a bottom reply-keyboard button tap. Return True if handled."""
+    if text in BUTTON_MAP:
+        provider = BUTTON_MAP[text]
+        context.user_data["pending"] = provider
+        await update.message.reply_text(
+            PROVIDER_PROMPTS[provider] + "\n\n(/cancel to abort)",
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(),
+        )
+        return True
+    if text == "📄 Bulk .txt":
+        await update.message.reply_text(
             "Send a `.txt` file, one check per line (max "
             f"{MAX_FILE_LINES}). Formats are in /help — e.g. `sendgrid|SG.your_key`.",
             parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(),
         )
-    elif data == "menu:help":
-        await query.message.reply_text(HELP_TEXT.format(max_lines=MAX_FILE_LINES), parse_mode="Markdown")
+        return True
+    if text == "❓ Help":
+        await update.message.reply_text(
+            HELP_TEXT.format(max_lines=MAX_FILE_LINES), parse_mode="Markdown", reply_markup=main_menu_keyboard()
+        )
+        return True
+    return False
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -378,7 +369,12 @@ def _args_text(update: Update) -> str:
 
 async def _reply_result(update: Update, context: ContextTypes.DEFAULT_TYPE, result: dict):
     await try_delete(update)
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=format_result(result), parse_mode="Markdown")
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=format_result(result),
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard(),
+    )
     await send_log(context, format_log_single(update, result))
 
 
@@ -585,6 +581,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
     text = (update.message.text or "").strip()
+    if await on_menu_button(update, context, text):
+        return
     pending = context.user_data.pop("pending", None)
     if pending:
         await _run_pending(update, context, pending, text)
@@ -727,7 +725,6 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
-    app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("myid", myid_cmd))
     app.add_handler(CommandHandler("loghere", loghere_cmd))
