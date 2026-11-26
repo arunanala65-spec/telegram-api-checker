@@ -266,12 +266,6 @@ Max {max_lines} lines per file. Results come back as live.txt / dead.txt (keys m
 
 *Menu:* tap /menu (or /start) and pick a checker button — SendGrid, Brevo, Mailgun, Mailjet, AWS SES, SMTP — then send the key when asked. /cancel aborts. Commands below still work too. Results also show the account's sender emails/identities when the provider exposes them.
 
-*Logs to Telegram (owner-only):*
-`/loghere` — owner only: set THIS chat as the log destination (the first user to send it becomes the owner; or set env OWNER_ID)
-`/myid` — show your user ID + chat ID (for OWNER_ID / LOG_CHAT_ID / ALLOWED_USER_IDS)
-`/logs` — owner only: show the last 20 log entries
-Every single check and every bulk summary is forwarded to the owner's log chat. Logs contain masked keys only — never full secrets.
-
 *Privacy:* read-only official endpoints + SMTP login only. Full keys/passwords are never saved or logged.
 """
 
@@ -386,9 +380,7 @@ async def myid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     await update.message.reply_text(
         f"Your user ID: {u.id if u else '?'}\n"
-        f"This chat ID: {chat.id if chat else '?'}\n"
-        f"Log chat ID (current): {get_log_chat_id() or 'not set — send /loghere'}\n\n"
-        "Use the user ID for ALLOWED_USER_IDS and the chat ID for LOG_CHAT_ID on the host."
+        f"This chat ID: {chat.id if chat else '?'}"
     )
 
 
@@ -399,18 +391,14 @@ async def loghere_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global _runtime_log_chat_id, _runtime_owner_id
     owner = get_owner_id()
     if owner and not is_owner(update):
-        await update.message.reply_text("🔒 Logs are owner-only. Only the bot owner can set the log destination.")
+        await update.message.reply_text("🔒 Owner only.")
         return
     if not owner:
         # First claim: this user becomes the bot owner for log purposes.
         _runtime_owner_id = update.effective_user.id
     _runtime_log_chat_id = update.effective_chat.id
     _save_log_state()
-    await update.message.reply_text(
-        "✅ Log destination set to this chat (owner-only).\n"
-        "Every check result (masked keys only) will now be forwarded here.\n"
-        "Send /logs anytime to see recent entries."
-    )
+    await update.message.reply_text("✅ Done.")
     await send_log(context, f"📝 LOG — Log destination set\nTime: {_now_str()}\nSet by: {_user_label(update)}")
 
 
@@ -419,7 +407,7 @@ async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Sorry, this bot is private.")
         return
     if not is_owner(update):
-        await update.message.reply_text("🔒 Logs are owner-only. The bot owner can view them with /logs after sending /loghere.")
+        await update.message.reply_text("🔒 Owner only.")
         return
     try:
         with open(LOG_FILE, encoding="utf-8") as f:
@@ -427,7 +415,7 @@ async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         entries = []
     if not entries:
-        await update.message.reply_text("No logs yet. Run a check first, e.g. /sendgrid SG.your_key")
+        await update.message.reply_text("No logs yet.")
         return
     tail = entries[-20:]
     text = "🗂 Last logs:\n\n" + "\n".join(tail)
